@@ -1,0 +1,11 @@
+from users import user_labeler
+from coach_system import coach_labeler
+from daily_income_system import daily_income_labeler, init_daily_income_system
+
+# Добавить все лейблеры в бота
+bot.labeler.load(user_labeler)
+bot.labeler.load(coach_labeler)
+bot.labeler.load(daily_income_labeler)
+
+# Инициализировать системы
+await init_daily_income_system()
