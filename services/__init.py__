@@ -1,0 +1,790 @@
+"""
+Модуль для работы с базой данных MongoDB
+"""
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+import asyncio
+
+import motor.motor_asyncio
+from bson import ObjectId
+
+from bot.core.config import settings
+
+# Подключение к MongoDB
+client = motor.motor_asyncio.AsyncIOMotorClient(settings.MONGODB_URI)
+db = client[settings.MONGODB_DB_NAME]
+
+# ======================
+# ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
+# ======================
+
+async def init_db():
+    """Инициализация базы данных, создание индексов"""
+    try:
+        # Индексы для коллекции players
+        await db.players.create_index("user_id", unique=True)
+        await db.players.create_index("username")
+        await db.players.create_index("clan_id")
+        await db.players.create_index("balance")
+        await db.players.create_index("dumbbell_level")
+        
+        # Индексы для коллекции clans
+        await db.clans.create_index("tag", unique=True)
+        await db.clans.create_index("name")
+        await db.clans.create_index("owner_id")
+        await db.clans.create_index("level")
+        await db.clans.create_index("treasury")
+        
+        # Индексы для коллекции transactions
+        await db.transactions.create_index("user_id")
+        await db.transactions.create_index("timestamp")
+        await db.transactions.create_index("type")
+        
+        # Индексы для коллекции clan_logs
+        await db.clan_logs.create_index("clan_id")
+        await db.clan_logs.create_index("user_id")
+        await db.clan_logs.create_index("created_at")
+        
+        # Индексы для коллекции daily_income_stats
+        await db.daily_income_stats.create_index("user_id", unique=True)
+        
+        print("✅ Индексы базы данных созданы")
+    except Exception as e:
+        print(f"❌ Ошибка при создании индексов: {e}")
+
+# ======================
+# ФУНКЦИИ ДЛЯ РАБОТЫ С ИГРОКАМИ
+# ======================
+
+async def create_player(user_id: int, username: str) -> dict:
+    """Создание нового игрока"""
+    player = {
+        "user_id": user_id,
+        "username": username,
+        "balance": settings.START_BALANCE,
+        "power": 0,
+        "dumbbell_level": 1,
+        "dumbbell_name": settings.DUMBBELL_LEVELS[1]["name"],
+        "total_lifts": 0,
+        "total_earned": 0,
+        "total_spent": 0,
+        "fitness_halls": 0,
+        "clan_id": None,
+        "clan_role": None,
+        "clan_joined_at": None,
+        "clan_contributions": 0,
+        "admin_level": 0,
+        "is_banned": 0,
+        "custom_income": None,
+        "last_dumbbell_use": None,
+        "last_active": datetime.now().isoformat(),
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+    
+    try:
+        await db.players.insert_one(player)
+        return player
+    except Exception as e:
+        print(f"❌ Ошибка при создании игрока {user_id}: {e}")
+        return None
+
+async def get_player(user_id: int) -> Optional[dict]:
+    """Получение игрока по user_id"""
+    try:
+        player = await db.players.find_one({"user_id": user_id})
+        if player:
+            # Обновляем last_active
+            await db.players.update_one(
+                {"user_id": user_id},
+                {"$set": {"last_active": datetime.now().isoformat()}}
+            )
+        return player
+    except Exception as e:
+        print(f"❌ Ошибка при получении игрока {user_id}: {e}")
+        return None
+
+async def update_player_balance(
+    user_id: int,
+    amount: int,
+    transaction_type: str,
+    description: str,
+    clan_id: Optional[int] = None,
+    related_user_id: Optional[int] = None
+) -> bool:
+    """Обновление баланса игрока с записью транзакции"""
+    try:
+        player = await get_player(user_id)
+        if not player:
+            return False
+        
+        new_balance = player["balance"] + amount
+        
+        # Обновляем баланс
+        await db.players.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "balance": new_balance,
+                    "updated_at": datetime.now().isoformat()
+                },
+                "$inc": {
+                    "total_earned": amount if amount > 0 else 0,
+                    "total_spent": -amount if amount < 0 else 0
+                }
+            }
+        )
+        
+        # Записываем транзакцию
+        transaction = {
+            "user_id": user_id,
+            "amount": amount,
+            "new_balance": new_balance,
+            "type": transaction_type,
+            "description": description,
+            "clan_id": clan_id,
+            "related_user_id": related_user_id,
+            "timestamp": datetime.now().isoformat()
+        }
+        await db.transactions.insert_one(transaction)
+        
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении баланса {user_id}: {e}")
+        return False
+
+async def update_username(user_id: int, new_username: str) -> bool:
+    """Обновление ника игрока"""
+    try:
+        await db.players.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "username": new_username,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении ника {user_id}: {e}")
+        return False
+
+async def update_dumbbell_level(user_id: int, new_level: int, new_name: str) -> bool:
+    """Обновление уровня гантели"""
+    try:
+        await db.players.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "dumbbell_level": new_level,
+                    "dumbbell_name": new_name,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении гантели {user_id}: {e}")
+        return False
+
+async def update_fitness_halls(user_id: int, count: int, total_price: int) -> int:
+    """Обновление количества фитнес-залов"""
+    try:
+        player = await get_player(user_id)
+        current_halls = player.get("fitness_halls", 0)
+        new_halls = current_halls + count
+        
+        await db.players.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "fitness_halls": new_halls,
+                    "updated_at": datetime.now().isoformat()
+                },
+                "$inc": {
+                    "total_spent": total_price
+                }
+            }
+        )
+        
+        # Записываем дневную покупку
+        today = datetime.now().strftime("%Y-%m-%d")
+        await db.daily_purchases.update_one(
+            {"user_id": user_id, "date": today},
+            {"$inc": {"count": count}},
+            upsert=True
+        )
+        
+        return new_halls
+    except Exception as e:
+        print(f"❌ Ошибка при покупке залов {user_id}: {e}")
+        raise e
+
+async def get_player_fitness_halls(user_id: int) -> int:
+    """Получить количество фитнес-залов игрока"""
+    try:
+        player = await db.players.find_one({"user_id": user_id})
+        if not player:
+            return 0
+        return player.get("fitness_halls", 0)
+    except Exception as e:
+        print(f"❌ Ошибка получения залов игрока {user_id}: {e}")
+        return 0
+
+async def get_daily_purchases(user_id: int) -> int:
+    """Получить количество покупок за сегодня"""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        record = await db.daily_purchases.find_one({"user_id": user_id, "date": today})
+        return record.get("count", 0) if record else 0
+    except Exception as e:
+        print(f"❌ Ошибка получения дневных покупок {user_id}: {e}")
+        return 0
+
+async def get_all_players_with_halls() -> list:
+    """Получить всех игроков у которых есть фитнес-залы"""
+    try:
+        cursor = db.players.find({"fitness_halls": {"$gt": 0}})
+        players = await cursor.to_list(length=None)
+        return players
+    except Exception as e:
+        print(f"❌ Ошибка получения игроков с залами: {e}")
+        return []
+
+# ======================
+# ФУНКЦИИ ДЛЯ РАБОТЫ С КЛАНАМИ
+# ======================
+
+async def create_clan(tag: str, name: str, owner_id: int) -> dict:
+    """Создание нового клана"""
+    try:
+        # Проверяем уникальность тега
+        existing = await db.clans.find_one({"tag": tag})
+        if existing:
+            return {"success": False, "error": "Клан с таким тегом уже существует"}
+        
+        clan = {
+            "_id": int(datetime.now().timestamp()),  # Используем timestamp как ID
+            "tag": tag,
+            "name": name,
+            "owner_id": owner_id,
+            "level": 1,
+            "treasury": 0,
+            "member_count": 1,
+            "total_income": 0,
+            "description": "Нет описания",
+            "banned_players": [],
+            "settings": {
+                "requirements": {"min_level": 1},
+                "greeting": None
+            },
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        await db.clans.insert_one(clan)
+        
+        # Обновляем игрока
+        await db.players.update_one(
+            {"user_id": owner_id},
+            {
+                "$set": {
+                    "clan_id": clan["_id"],
+                    "clan_role": "owner",
+                    "clan_joined_at": datetime.now().isoformat(),
+                    "clan_contributions": 0,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        return {"success": True, "clan_id": clan["_id"]}
+    except Exception as e:
+        print(f"❌ Ошибка при создании клана: {e}")
+        return {"success": False, "error": str(e)}
+
+async def get_clan_by_tag(tag: str) -> Optional[dict]:
+    """Получить клан по тегу"""
+    try:
+        return await db.clans.find_one({"tag": tag})
+    except Exception as e:
+        print(f"❌ Ошибка при получении клана по тегу {tag}: {e}")
+        return None
+
+async def get_player_clan(user_id: int) -> Optional[dict]:
+    """Получить клан игрока"""
+    try:
+        player = await db.players.find_one({"user_id": user_id})
+        if not player or not player.get("clan_id"):
+            return None
+        
+        clan = await db.clans.find_one({"_id": player["clan_id"]})
+        return clan
+    except Exception as e:
+        print(f"❌ Ошибка при получении клана игрока {user_id}: {e}")
+        return None
+
+async def get_clan_member_count(clan_id: int) -> int:
+    """Получить количество участников клана"""
+    try:
+        clan = await db.clans.find_one({"_id": clan_id})
+        return clan.get("member_count", 0) if clan else 0
+    except Exception as e:
+        print(f"❌ Ошибка при получении количества участников: {e}")
+        return 0
+
+async def get_clan_members(clan_id: int) -> list:
+    """Получить всех участников клана"""
+    try:
+        cursor = db.players.find({"clan_id": clan_id})
+        members = await cursor.to_list(length=None)
+        return members
+    except Exception as e:
+        print(f"❌ Ошибка при получении участников клана: {e}")
+        return []
+
+async def get_member_clan_role(user_id: int, clan_id: int) -> tuple:
+    """Получить роль участника в клане"""
+    try:
+        player = await db.players.find_one({"user_id": user_id, "clan_id": clan_id})
+        if not player:
+            return (None, "Игрок не найден")
+        return (player.get("clan_role"), None)
+    except Exception as e:
+        print(f"❌ Ошибка при получении роли: {e}")
+        return (None, str(e))
+
+async def deposit_to_clan_treasury(user_id: int, amount: int) -> dict:
+    """Внесение денег в казну клана"""
+    try:
+        player = await get_player(user_id)
+        if not player:
+            return {"success": False, "error": "Игрок не найден"}
+        
+        clan_id = player.get("clan_id")
+        if not clan_id:
+            return {"success": False, "error": "Вы не в клане"}
+        
+        clan = await db.clans.find_one({"_id": clan_id})
+        if not clan:
+            return {"success": False, "error": "Клан не найден"}
+        
+        # Обновляем казну
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {"$inc": {"treasury": amount}}
+        )
+        
+        # Обновляем вклад игрока
+        await db.players.update_one(
+            {"user_id": user_id},
+            {"$inc": {"clan_contributions": amount}}
+        )
+        
+        # Получаем обновленные данные
+        player = await get_player(user_id)
+        total_contributions = player.get("clan_contributions", 0)
+        
+        return {
+            "success": True,
+            "total_contributions": total_contributions
+        }
+    except Exception as e:
+        print(f"❌ Ошибка при внесении в казну: {e}")
+        return {"success": False, "error": str(e)}
+
+async def subtract_treasury(clan_id: int, amount: int) -> bool:
+    """Списание денег из казны клана"""
+    try:
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {"$inc": {"treasury": -amount}}
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при списании из казны: {e}")
+        return False
+
+async def upgrade_clan(clan_id: int, upgrade_one_level: bool = True, cost: int = 0, levels: int = 1) -> dict:
+    """Улучшение клана"""
+    try:
+        clan = await db.clans.find_one({"_id": clan_id})
+        if not clan:
+            return {"success": False, "error": "Клан не найден"}
+        
+        current_level = clan["level"]
+        new_level = current_level + (1 if upgrade_one_level else levels)
+        
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {
+                "$set": {
+                    "level": new_level,
+                    "updated_at": datetime.now().isoformat()
+                },
+                "$inc": {"treasury": -cost}
+            }
+        )
+        
+        return {
+            "success": True,
+            "new_level": new_level
+        }
+    except Exception as e:
+        print(f"❌ Ошибка при улучшении клана: {e}")
+        return {"success": False, "error": str(e)}
+
+async def update_clan_name(clan_id: int, new_name: str) -> bool:
+    """Обновление названия клана"""
+    try:
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {
+                "$set": {
+                    "name": new_name,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении названия клана: {e}")
+        return False
+
+async def update_clan_description(clan_id: int, description: str) -> bool:
+    """Обновление описания клана"""
+    try:
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {
+                "$set": {
+                    "description": description,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении описания клана: {e}")
+        return False
+
+async def update_clan_settings(clan_id: int, settings: dict) -> bool:
+    """Обновление настроек клана"""
+    try:
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {
+                "$set": {
+                    "settings": settings,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении настроек клана: {e}")
+        return False
+
+async def delete_clan(clan_id: int) -> bool:
+    """Удаление клана"""
+    try:
+        # Удаляем клан
+        await db.clans.delete_one({"_id": clan_id})
+        
+        # Обновляем всех игроков клана
+        await db.players.update_many(
+            {"clan_id": clan_id},
+            {
+                "$set": {
+                    "clan_id": None,
+                    "clan_role": None,
+                    "clan_joined_at": None,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при удалении клана: {e}")
+        return False
+
+async def get_clan_requirements(clan_id: int) -> dict:
+    """Получить требования для вступления в клан"""
+    try:
+        clan = await db.clans.find_one({"_id": clan_id})
+        if not clan:
+            return {"min_level": 1}
+        
+        settings = clan.get("settings", {})
+        requirements = settings.get("requirements", {"min_level": 1})
+        return requirements
+    except Exception as e:
+        print(f"❌ Ошибка при получении требований клана: {e}")
+        return {"min_level": 1}
+
+async def get_player_contributions(user_id: int, clan_id: int) -> int:
+    """Получить вклад игрока в казну клана"""
+    try:
+        player = await db.players.find_one({"user_id": user_id, "clan_id": clan_id})
+        if not player:
+            return 0
+        return player.get("clan_contributions", 0)
+    except Exception as e:
+        print(f"❌ Ошибка при получении вклада игрока: {e}")
+        return 0
+
+async def get_top_clans(limit: int = 10) -> list:
+    """Получить топ кланов по казне"""
+    try:
+        cursor = db.clans.find({}).sort("treasury", -1).limit(limit)
+        clans = await cursor.to_list(length=limit)
+        return clans
+    except Exception as e:
+        print(f"❌ Ошибка при получении топа кланов: {e}")
+        return []
+
+async def get_all_clans() -> list:
+    """Получить все кланы"""
+    try:
+        cursor = db.clans.find({})
+        clans = await cursor.to_list(length=None)
+        return clans
+    except Exception as e:
+        print(f"❌ Ошибка при получении всех кланов: {e}")
+        return []
+
+async def update_clan_daily_income(clan_id: int, amount: int) -> bool:
+    """Обновить ежедневный доход клана"""
+    try:
+        await db.clans.update_one(
+            {"_id": clan_id},
+            {
+                "$inc": {"treasury": amount, "total_income": amount},
+                "$set": {"last_daily_income": datetime.now().isoformat()}
+            }
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка обновления дохода клана: {e}")
+        return False
+
+async def get_clan_bonuses(clan_id: int) -> dict:
+    """Получить бонусы клана из БД"""
+    try:
+        clan = await db.clans.find_one({"_id": clan_id})
+        if not clan:
+            return {}
+        
+        level = clan.get("level", 1)
+        from bot.services.clans import get_clan_bonuses
+        return get_clan_bonuses(level)
+    except Exception as e:
+        print(f"❌ Ошибка получения бонусов клана: {e}")
+        return {}
+
+# ======================
+# ФУНКЦИИ ДЛЯ ЛОГИРОВАНИЯ
+# ======================
+
+async def log_clan_action(clan_id: int, user_id: int, action_type: str, details: str) -> bool:
+    """Логирование действий в клане"""
+    try:
+        log_entry = {
+            "clan_id": clan_id,
+            "user_id": user_id,
+            "action_type": action_type,
+            "details": details,
+            "created_at": datetime.now().isoformat()
+        }
+        await db.clan_logs.insert_one(log_entry)
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при логировании действия клана: {e}")
+        return False
+
+async def get_clan_log(clan_id: int, limit: int = 50) -> list:
+    """Получить лог действий клана"""
+    try:
+        cursor = db.clan_logs.find({"clan_id": clan_id}).sort("created_at", -1).limit(limit)
+        logs = await cursor.to_list(length=limit)
+        return logs
+    except Exception as e:
+        print(f"❌ Ошибка при получении лога клана: {e}")
+        return []
+
+async def log_collection_with_user(
+    clan_id: int,
+    user_id: int,
+    action_type: str,
+    amount: int,
+    description: str
+) -> bool:
+    """Логирование финансовых операций клана"""
+    try:
+        log_entry = {
+            "clan_id": clan_id,
+            "user_id": user_id,
+            "action_type": action_type,
+            "amount": amount,
+            "description": description,
+            "created_at": datetime.now().isoformat()
+        }
+        await db.clan_finance_logs.insert_one(log_entry)
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при логировании финансов клана: {e}")
+        return False
+
+async def get_clan_treasury_log(clan_id: int, limit: int = 20) -> list:
+    """Получить лог операций с казной"""
+    try:
+        cursor = db.clan_finance_logs.find({"clan_id": clan_id}).sort("created_at", -1).limit(limit)
+        logs = await cursor.to_list(length=limit)
+        return logs
+    except Exception as e:
+        print(f"❌ Ошибка при получении лога казны: {e}")
+        return []
+
+# ======================
+# ФУНКЦИИ ДЛЯ ЕЖЕДНЕВНОГО ДОХОДА
+# ======================
+
+async def add_daily_fitness_hall_income(user_id: int, amount: int, description: str) -> bool:
+    """Начисление ежедневного дохода с фитнес-залов"""
+    try:
+        # Обновляем баланс
+        success = await update_player_balance(
+            user_id,
+            amount,
+            "daily_fitness_income",
+            description,
+            None
+        )
+        
+        if success:
+            # Обновляем статистику дохода
+            today = datetime.now().strftime("%Y-%m-%d")
+            await db.daily_income_stats.update_one(
+                {"user_id": user_id},
+                {
+                    "$inc": {"total_received": amount},
+                    "$set": {"last_received_date": datetime.now().isoformat()},
+                    "$push": {"history": {
+                        "date": today,
+                        "amount": amount
+                    }}
+                },
+                upsert=True
+            )
+        
+        return success
+    except Exception as e:
+        print(f"❌ Ошибка при начислении дохода {user_id}: {e}")
+        return False
+
+async def get_daily_income_stats(user_id: int) -> Optional[dict]:
+    """Получить статистику ежедневного дохода"""
+    try:
+        stats = await db.daily_income_stats.find_one({"user_id": user_id})
+        return stats
+    except Exception as e:
+        print(f"❌ Ошибка при получении статистики дохода: {e}")
+        return None
+
+async def reset_daily_income_stats() -> bool:
+    """Сброс статистики ежедневного дохода (для тестов)"""
+    try:
+        await db.daily_income_stats.delete_many({})
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при сбросе статистики: {e}")
+        return False
+
+# ======================
+# ФУНКЦИИ ДЛЯ ДОСТУПА К ИНФЕ
+# ======================
+
+async def set_info_access(user_id: int) -> bool:
+    """Выдать доступ к команде инфа"""
+    try:
+        await db.info_access.update_one(
+            {"user_id": user_id},
+            {"$set": {"has_access": True, "granted_at": datetime.now().isoformat()}},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при выдаче доступа к инфе: {e}")
+        return False
+
+async def get_info_access_status(user_id: int) -> bool:
+    """Проверить доступ к команде инфа"""
+    try:
+        # Администраторы имеют доступ по умолчанию
+        player = await get_player(user_id)
+        if player and player.get("admin_level", 0) > 0:
+            return True
+        
+        access = await db.info_access.find_one({"user_id": user_id})
+        return access.get("has_access", False) if access else False
+    except Exception as e:
+        print(f"❌ Ошибка при проверке доступа к инфе: {e}")
+        return False
+
+async def remove_info_access(user_id: int) -> bool:
+    """Убрать доступ к команде инфа"""
+    try:
+        await db.info_access.delete_one({"user_id": user_id})
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при удалении доступа к инфе: {e}")
+        return False
+
+# ======================
+# ЭКСПОРТ
+# ======================
+
+__all__ = [
+    'db',
+    'init_db',
+    'create_player',
+    'get_player',
+    'update_player_balance',
+    'update_username',
+    'update_dumbbell_level',
+    'update_fitness_halls',
+    'get_player_fitness_halls',
+    'get_daily_purchases',
+    'get_all_players_with_halls',
+    'create_clan',
+    'get_clan_by_tag',
+    'get_player_clan',
+    'get_clan_member_count',
+    'get_clan_members',
+    'get_member_clan_role',
+    'deposit_to_clan_treasury',
+    'subtract_treasury',
+    'upgrade_clan',
+    'update_clan_name',
+    'update_clan_description',
+    'update_clan_settings',
+    'delete_clan',
+    'get_clan_requirements',
+    'get_player_contributions',
+    'get_top_clans',
+    'get_all_clans',
+    'update_clan_daily_income',
+    'get_clan_bonuses',
+    'log_clan_action',
+    'get_clan_log',
+    'log_collection_with_user',
+    'get_clan_treasury_log',
+    'add_daily_fitness_hall_income',
+    'get_daily_income_stats',
+    'reset_daily_income_stats',
+    'set_info_access',
+    'get_info_access_status',
+    'remove_info_access'
+  ]
